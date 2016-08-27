@@ -17,17 +17,15 @@
 package com.android.ims;
 
 import android.app.PendingIntent;
-import android.app.QueuedWork;
 import android.content.Context;
 import android.content.Intent;
-import android.content.SharedPreferences;
+import android.net.Uri;
 import android.os.IBinder;
 import android.os.Message;
 import android.os.PersistableBundle;
 import android.os.RemoteException;
 import android.os.ServiceManager;
 import android.os.SystemProperties;
-import android.preference.PreferenceManager;
 import android.provider.Settings;
 import android.telecom.TelecomManager;
 import android.telephony.CarrierConfigManager;
@@ -38,12 +36,15 @@ import android.telephony.TelephonyManager;
 import com.android.ims.internal.IImsCallSession;
 import com.android.ims.internal.IImsEcbm;
 import com.android.ims.internal.IImsEcbmListener;
+import com.android.ims.internal.IImsMultiEndpoint;
 import com.android.ims.internal.IImsRegistrationListener;
 import com.android.ims.internal.IImsService;
 import com.android.ims.internal.IImsUt;
 import com.android.ims.internal.ImsCallSession;
 import com.android.ims.internal.IImsConfig;
 
+import java.io.FileDescriptor;
+import java.io.PrintWriter;
 import java.util.HashMap;
 
 /**
@@ -169,10 +170,13 @@ public class ImsManager {
     // Interface to get/set ims config items
     private ImsConfig mConfig = null;
     private boolean mConfigUpdated = false;
-    private static final String PREF_ENABLE_VIDEO_CALLING_KEY = "enable_video_calling";
+
+    private ImsConfigListener mImsConfigListener;
 
     // ECBM interface
     private ImsEcbm mEcbm = null;
+
+    private ImsMultiEndpoint mMultiEndpoint = null;
 
     /**
      * Gets a manager instance.
@@ -197,6 +201,12 @@ public class ImsManager {
      * Returns the user configuration of Enhanced 4G LTE Mode setting
      */
     public static boolean isEnhanced4gLteModeSettingEnabledByUser(Context context) {
+        // If user can't edit Enhanced 4G LTE Mode, it assumes Enhanced 4G LTE Mode is always true.
+        // If user changes SIM from editable mode to uneditable mode, need to return true.
+        if (!getBooleanCarrierConfig(context,
+                    CarrierConfigManager.KEY_EDITABLE_ENHANCED_4G_LTE_BOOL)) {
+            return true;
+        }
         int enabled = android.provider.Settings.Global.getInt(
                     context.getContentResolver(),
                     android.provider.Settings.Global.ENHANCED_4G_MODE_ENABLED, ImsConfig.FeatureValueConstants.ON);
@@ -231,7 +241,7 @@ public class ImsManager {
      */
     public static boolean isNonTtyOrTtyOnVolteEnabled(Context context) {
         if (getBooleanCarrierConfig(context,
-                    CarrierConfigManager.KEY_CARRIER_VOLTE_TTY_SUPPORTED_BOOL)) {
+                CarrierConfigManager.KEY_CARRIER_VOLTE_TTY_SUPPORTED_BOOL)) {
             return true;
         }
 
@@ -302,12 +312,58 @@ public class ImsManager {
     }
 
     /**
+     * Returns the user configuration of VT setting
+     */
+    public static boolean isVtEnabledByUser(Context context) {
+        int enabled = android.provider.Settings.Global.getInt(context.getContentResolver(),
+                android.provider.Settings.Global.VT_IMS_ENABLED,
+                ImsConfig.FeatureValueConstants.ON);
+        return (enabled == 1) ? true : false;
+    }
+
+    /**
+     * Change persistent VT enabled setting
+     */
+    public static void setVtSetting(Context context, boolean enabled) {
+        int value = enabled ? 1 : 0;
+        android.provider.Settings.Global.putInt(context.getContentResolver(),
+                android.provider.Settings.Global.VT_IMS_ENABLED, value);
+
+        ImsManager imsManager = ImsManager.getInstance(context,
+                SubscriptionManager.getDefaultVoicePhoneId());
+        if (imsManager != null) {
+            try {
+                ImsConfig config = imsManager.getConfigInterface();
+                config.setFeatureValue(ImsConfig.FeatureConstants.FEATURE_TYPE_VIDEO_OVER_LTE,
+                        TelephonyManager.NETWORK_TYPE_LTE,
+                        enabled ? ImsConfig.FeatureValueConstants.ON
+                                : ImsConfig.FeatureValueConstants.OFF,
+                        imsManager.mImsConfigListener);
+
+                if (enabled) {
+                    imsManager.turnOnIms();
+                } else if (getBooleanCarrierConfig(context,
+                        CarrierConfigManager.KEY_CARRIER_ALLOW_TURNOFF_IMS_BOOL)
+                        && (!isVolteEnabledByPlatform(context)
+                        || !isEnhanced4gLteModeSettingEnabledByUser(context))) {
+                    log("setVtSetting() : imsServiceAllowTurnOff -> turnOffIms");
+                    imsManager.turnOffIms();
+                }
+            } catch (ImsException e) {
+                loge("setVtSetting(): " + e);
+            }
+        }
+    }
+
+    /**
      * Returns the user configuration of WFC setting
      */
     public static boolean isWfcEnabledByUser(Context context) {
         int enabled = android.provider.Settings.Global.getInt(context.getContentResolver(),
                 android.provider.Settings.Global.WFC_IMS_ENABLED,
-                ImsConfig.FeatureValueConstants.OFF);
+                getBooleanCarrierConfig(context,
+                        CarrierConfigManager.KEY_CARRIER_DEFAULT_WFC_IMS_ENABLED_BOOL) ?
+                        ImsConfig.FeatureValueConstants.ON : ImsConfig.FeatureValueConstants.OFF);
         return (enabled == 1) ? true : false;
     }
 
@@ -327,7 +383,8 @@ public class ImsManager {
                 config.setFeatureValue(ImsConfig.FeatureConstants.FEATURE_TYPE_VOICE_OVER_WIFI,
                         TelephonyManager.NETWORK_TYPE_IWLAN,
                         enabled ? ImsConfig.FeatureValueConstants.ON
-                                : ImsConfig.FeatureValueConstants.OFF, null);
+                                : ImsConfig.FeatureValueConstants.OFF,
+                        imsManager.mImsConfigListener);
 
                 if (enabled) {
                     imsManager.turnOnIms();
@@ -354,8 +411,8 @@ public class ImsManager {
      */
     public static int getWfcMode(Context context) {
         int setting = android.provider.Settings.Global.getInt(context.getContentResolver(),
-                android.provider.Settings.Global.WFC_IMS_MODE,
-                ImsConfig.WfcModeFeatureValueConstants.WIFI_PREFERRED);
+                android.provider.Settings.Global.WFC_IMS_MODE, getIntCarrierConfig(context,
+                        CarrierConfigManager.KEY_CARRIER_DEFAULT_WFC_IMS_MODE_INT));
         if (DBG) log("getWfcMode - setting=" + setting);
         return setting;
     }
@@ -376,7 +433,7 @@ public class ImsManager {
                 SubscriptionManager.getDefaultVoicePhoneId());
         if (imsManager != null) {
             final int value = wfcMode;
-            QueuedWork.singleThreadExecutor().submit(new Runnable() {
+            Thread thread = new Thread(new Runnable() {
                 public void run() {
                     try {
                         imsManager.getConfigInterface().setProvisionedValue(
@@ -387,6 +444,7 @@ public class ImsManager {
                     }
                 }
             });
+            thread.start();
         }
     }
 
@@ -396,7 +454,9 @@ public class ImsManager {
     public static boolean isWfcRoamingEnabledByUser(Context context) {
         int enabled = android.provider.Settings.Global.getInt(context.getContentResolver(),
                 android.provider.Settings.Global.WFC_IMS_ROAMING_ENABLED,
-                ImsConfig.FeatureValueConstants.OFF);
+                getBooleanCarrierConfig(context,
+                        CarrierConfigManager.KEY_CARRIER_DEFAULT_WFC_IMS_ROAMING_ENABLED_BOOL) ?
+                        ImsConfig.FeatureValueConstants.ON : ImsConfig.FeatureValueConstants.OFF);
         return (enabled == 1) ? true : false;
     }
 
@@ -406,8 +466,7 @@ public class ImsManager {
     public static void setWfcRoamingSetting(Context context, boolean enabled) {
         android.provider.Settings.Global.putInt(context.getContentResolver(),
                 android.provider.Settings.Global.WFC_IMS_ROAMING_ENABLED,
-                enabled
-                        ? ImsConfig.FeatureValueConstants.ON
+                enabled ? ImsConfig.FeatureValueConstants.ON
                         : ImsConfig.FeatureValueConstants.OFF);
 
         setWfcRoamingSettingInternal(context, enabled);
@@ -420,7 +479,7 @@ public class ImsManager {
             final int value = enabled
                     ? ImsConfig.FeatureValueConstants.ON
                     : ImsConfig.FeatureValueConstants.OFF;
-            QueuedWork.singleThreadExecutor().submit(new Runnable() {
+            Thread thread = new Thread(new Runnable() {
                 public void run() {
                     try {
                         imsManager.getConfigInterface().setProvisionedValue(
@@ -431,6 +490,7 @@ public class ImsManager {
                     }
                 }
             });
+            thread.start();
         }
     }
 
@@ -484,6 +544,14 @@ public class ImsManager {
      * @param force update
      */
     public static void updateImsServiceConfig(Context context, int phoneId, boolean force) {
+        if (!force) {
+            if (TelephonyManager.getDefault().getSimState() != TelephonyManager.SIM_STATE_READY) {
+                log("updateImsServiceConfig: SIM not ready");
+                // Don't disable IMS if SIM is not ready
+                return;
+            }
+        }
+
         final ImsManager imsManager = ImsManager.getInstance(context, phoneId);
         if (imsManager != null && (!imsManager.mConfigUpdated || force)) {
             try {
@@ -532,7 +600,7 @@ public class ImsManager {
                 isFeatureOn ?
                         ImsConfig.FeatureValueConstants.ON :
                         ImsConfig.FeatureValueConstants.OFF,
-                null);
+                mImsConfigListener);
 
         return isFeatureOn;
     }
@@ -544,13 +612,9 @@ public class ImsManager {
      */
     private boolean updateVideoCallFeatureValue() throws ImsException {
         boolean available = isVtEnabledByPlatform(mContext);
-        SharedPreferences sharedPrefs =
-                PreferenceManager.getDefaultSharedPreferences(mContext);
         boolean enabled = isEnhanced4gLteModeSettingEnabledByUser(mContext) &&
-                sharedPrefs.getBoolean(PREF_ENABLE_VIDEO_CALLING_KEY, true);
-        boolean isNonTty = Settings.Secure.getInt(mContext.getContentResolver(),
-                Settings.Secure.PREFERRED_TTY_MODE, TelecomManager.TTY_MODE_OFF)
-                == TelecomManager.TTY_MODE_OFF;
+                isVtEnabledByUser(mContext);
+        boolean isNonTty = isNonTtyOrTtyOnVolteEnabled(mContext);
         boolean isFeatureOn = available && enabled && isNonTty;
 
         log("updateVideoCallFeatureValue: available = " + available
@@ -563,7 +627,7 @@ public class ImsManager {
                 isFeatureOn ?
                         ImsConfig.FeatureValueConstants.ON :
                         ImsConfig.FeatureValueConstants.OFF,
-                null);
+                mImsConfigListener);
 
         return isFeatureOn;
     }
@@ -591,7 +655,7 @@ public class ImsManager {
                 isFeatureOn ?
                         ImsConfig.FeatureValueConstants.ON :
                         ImsConfig.FeatureValueConstants.OFF,
-                null);
+                mImsConfigListener);
 
         if (!isFeatureOn) {
             mode = ImsConfig.WfcModeFeatureValueConstants.CELLULAR_PREFERRED;
@@ -623,6 +687,10 @@ public class ImsManager {
         }
 
         return false;
+    }
+
+    public void setImsConfigListener(ImsConfigListener listener) {
+        mImsConfigListener = listener;
     }
 
     /**
@@ -699,6 +767,7 @@ public class ImsManager {
             mUt = null;
             mConfig = null;
             mEcbm = null;
+            mMultiEndpoint = null;
         }
     }
 
@@ -971,6 +1040,28 @@ public class ImsManager {
     }
 
     /**
+     * Get the int config from carrier config manager.
+     *
+     * @param context the context to get carrier service
+     * @param key config key defined in CarrierConfigManager
+     * @return integer value of corresponding key.
+     */
+    private static int getIntCarrierConfig(Context context, String key) {
+        CarrierConfigManager configManager = (CarrierConfigManager) context.getSystemService(
+                Context.CARRIER_CONFIG_SERVICE);
+        PersistableBundle b = null;
+        if (configManager != null) {
+            b = configManager.getConfig();
+        }
+        if (b != null) {
+            return b.getInt(key);
+        } else {
+            // Return static default defined in CarrierConfigManager.
+            return CarrierConfigManager.getDefaultConfig().getInt(key);
+        }
+    }
+
+    /**
      * Gets the call ID from the specified incoming call broadcast intent.
      *
      * @param incomingCallIntent the incoming call broadcast intent
@@ -1105,14 +1196,14 @@ public class ImsManager {
             ImsConfig config = getConfigInterface();
             if (config != null && (turnOn || !isImsTurnOffAllowed())) {
                 config.setFeatureValue(ImsConfig.FeatureConstants.FEATURE_TYPE_VOICE_OVER_LTE,
-                        TelephonyManager.NETWORK_TYPE_LTE, turnOn ? 1 : 0, null);
+                        TelephonyManager.NETWORK_TYPE_LTE, turnOn ? 1 : 0, mImsConfigListener);
+
                 if (isVtEnabledByPlatform(mContext)) {
-                    // TODO: once VT is available on platform:
-                    // - replace the '1' with the current user configuration of VT.
-                    // - separate exception checks for setFeatureValue() failures for VoLTE and VT.
-                    //   I.e. if VoLTE fails still try to configure VT.
+                    boolean enableViLte = turnOn && isVtEnabledByUser(mContext);
                     config.setFeatureValue(ImsConfig.FeatureConstants.FEATURE_TYPE_VIDEO_OVER_LTE,
-                            TelephonyManager.NETWORK_TYPE_LTE, turnOn ? 1 : 0, null);
+                            TelephonyManager.NETWORK_TYPE_LTE,
+                            enableViLte ? 1 : 0,
+                            mImsConfigListener);
                 }
             }
         } catch (ImsException e) {
@@ -1150,6 +1241,7 @@ public class ImsManager {
             mUt = null;
             mConfig = null;
             mEcbm = null;
+            mMultiEndpoint = null;
 
             if (mContext != null) {
                 Intent intent = new Intent(ACTION_IMS_SERVICE_DOWN);
@@ -1176,7 +1268,7 @@ public class ImsManager {
             return (mServiceClass == serviceClass);
         }
 
-        @Override
+        @Deprecated
         public void registrationConnected() {
             if (DBG) {
                 log("registrationConnected ::");
@@ -1187,10 +1279,36 @@ public class ImsManager {
             }
         }
 
-        @Override
+        @Deprecated
         public void registrationProgressing() {
             if (DBG) {
                 log("registrationProgressing ::");
+            }
+
+            if (mListener != null) {
+                mListener.onImsProgressing();
+            }
+        }
+
+        @Override
+        public void registrationConnectedWithRadioTech(int imsRadioTech) {
+            // Note: imsRadioTech value maps to RIL_RADIO_TECHNOLOGY
+            //       values in ServiceState.java.
+            if (DBG) {
+                log("registrationConnectedWithRadioTech :: imsRadioTech=" + imsRadioTech);
+            }
+
+            if (mListener != null) {
+                mListener.onImsConnected();
+            }
+        }
+
+        @Override
+        public void registrationProgressingWithRadioTech(int imsRadioTech) {
+            // Note: imsRadioTech value maps to RIL_RADIO_TECHNOLOGY
+            //       values in ServiceState.java.
+            if (DBG) {
+                log("registrationProgressingWithRadioTech :: imsRadioTech=" + imsRadioTech);
             }
 
             if (mListener != null) {
@@ -1261,7 +1379,16 @@ public class ImsManager {
             }
         }
 
+        @Override
+        public void registrationAssociatedUriChanged(Uri[] uris) {
+            if (DBG) log("registrationAssociatedUriChanged ::");
+
+            if (mListener != null) {
+                mListener.registrationAssociatedUriChanged(uris);
+            }
+        }
     }
+
     /**
      * Gets the ECBM interface to request ECBM exit.
      *
@@ -1290,6 +1417,34 @@ public class ImsManager {
     }
 
     /**
+     * Gets the Multi-Endpoint interface to subscribe to multi-enpoint notifications..
+     *
+     * @param serviceId a service id which is obtained from {@link ImsManager#open}
+     * @return the multi-endpoint interface instance
+     * @throws ImsException if getting the multi-endpoint interface results in an error
+     */
+    public ImsMultiEndpoint getMultiEndpointInterface(int serviceId) throws ImsException {
+        if (mMultiEndpoint == null) {
+            checkAndThrowExceptionIfServiceUnavailable();
+
+            try {
+                IImsMultiEndpoint iImsMultiEndpoint = mImsService.getMultiEndpointInterface(
+                        serviceId);
+
+                if (iImsMultiEndpoint == null) {
+                    throw new ImsException("getMultiEndpointInterface()",
+                            ImsReasonInfo.CODE_MULTIENDPOINT_NOT_SUPPORTED);
+                }
+                mMultiEndpoint = new ImsMultiEndpoint(iImsMultiEndpoint);
+            } catch (RemoteException e) {
+                throw new ImsException("getMultiEndpointInterface()", e,
+                        ImsReasonInfo.CODE_LOCAL_IMS_SERVICE_DOWN);
+            }
+        }
+        return mMultiEndpoint;
+    }
+
+    /**
      * Resets ImsManager settings back to factory defaults.
      *
      * @hide
@@ -1303,27 +1458,55 @@ public class ImsManager {
         // Set VoWiFi to default
         android.provider.Settings.Global.putInt(context.getContentResolver(),
                 android.provider.Settings.Global.WFC_IMS_ENABLED,
-                ImsConfig.FeatureValueConstants.OFF);
+                getBooleanCarrierConfig(context,
+                        CarrierConfigManager.KEY_CARRIER_DEFAULT_WFC_IMS_ENABLED_BOOL) ?
+                        ImsConfig.FeatureValueConstants.ON : ImsConfig.FeatureValueConstants.OFF);
 
         // Set VoWiFi mode to default
         android.provider.Settings.Global.putInt(context.getContentResolver(),
                 android.provider.Settings.Global.WFC_IMS_MODE,
-                ImsConfig.WfcModeFeatureValueConstants.WIFI_PREFERRED);
+                getIntCarrierConfig(context,
+                        CarrierConfigManager.KEY_CARRIER_DEFAULT_WFC_IMS_MODE_INT));
 
         // Set VoWiFi roaming to default
         android.provider.Settings.Global.putInt(context.getContentResolver(),
                 android.provider.Settings.Global.WFC_IMS_ROAMING_ENABLED,
-                ImsConfig.FeatureValueConstants.OFF);
+                getBooleanCarrierConfig(context,
+                        CarrierConfigManager.KEY_CARRIER_DEFAULT_WFC_IMS_ROAMING_ENABLED_BOOL) ?
+                        ImsConfig.FeatureValueConstants.ON : ImsConfig.FeatureValueConstants.OFF);
 
         // Set VT to default
-        SharedPreferences sharedPrefs =
-                PreferenceManager.getDefaultSharedPreferences(context);
-        SharedPreferences.Editor editor = sharedPrefs.edit();
-        editor.putBoolean(PREF_ENABLE_VIDEO_CALLING_KEY, true);
-        editor.commit();
+        android.provider.Settings.Global.putInt(context.getContentResolver(),
+                android.provider.Settings.Global.VT_IMS_ENABLED,
+                ImsConfig.FeatureValueConstants.ON);
 
         // Push settings to ImsConfig
         ImsManager.updateImsServiceConfig(context,
                 SubscriptionManager.getDefaultVoicePhoneId(), true);
+    }
+
+    public void dump(FileDescriptor fd, PrintWriter pw, String[] args) {
+        pw.println("ImsManager:");
+        pw.println("  mPhoneId = " + mPhoneId);
+        pw.println("  mConfigUpdated = " + mConfigUpdated);
+        pw.println("  mImsService = " + mImsService);
+
+        pw.println("  isGbaValid = " + isGbaValid(mContext));
+        pw.println("  isImsTurnOffAllowed = " + isImsTurnOffAllowed());
+        pw.println("  isNonTtyOrTtyOnVolteEnabled = " + isNonTtyOrTtyOnVolteEnabled(mContext));
+
+        pw.println("  isVolteEnabledByPlatform = " + isVolteEnabledByPlatform(mContext));
+        pw.println("  isVolteProvisionedOnDevice = " + isVolteProvisionedOnDevice(mContext));
+        pw.println("  isEnhanced4gLteModeSettingEnabledByUser = " +
+                isEnhanced4gLteModeSettingEnabledByUser(mContext));
+        pw.println("  isVtEnabledByPlatform = " + isVtEnabledByPlatform(mContext));
+        pw.println("  isVtEnabledByUser = " + isVtEnabledByUser(mContext));
+
+        pw.println("  isWfcEnabledByPlatform = " + isWfcEnabledByPlatform(mContext));
+        pw.println("  isWfcEnabledByUser = " + isWfcEnabledByUser(mContext));
+        pw.println("  getWfcMode = " + getWfcMode(mContext));
+        pw.println("  isWfcRoamingEnabledByUser = " + isWfcRoamingEnabledByUser(mContext));
+
+        pw.flush();
     }
 }

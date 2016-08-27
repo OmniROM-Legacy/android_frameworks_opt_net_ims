@@ -1626,8 +1626,7 @@ public class ImsCall implements ICall {
             }
         }
 
-        if (mConferenceParticipants != null && !mConferenceParticipants.isEmpty()
-                && mListener != null) {
+        if (mConferenceParticipants != null && mListener != null) {
             try {
                 mListener.onConferenceParticipantsStateChanged(this, mConferenceParticipants);
             } catch (Throwable t) {
@@ -1903,6 +1902,9 @@ public class ImsCall implements ICall {
 
             listener = finalHostCall.mListener;
 
+            updateCallProfile(finalPeerCall);
+            updateCallProfile(finalHostCall);
+
             // Clear all the merge related flags.
             clearMergeInfo();
 
@@ -1938,6 +1940,20 @@ public class ImsCall implements ICall {
             }
         }
         return;
+    }
+
+    private static void updateCallProfile(ImsCall call) {
+        if (call != null) {
+            call.updateCallProfile();
+        }
+    }
+
+    private void updateCallProfile() {
+        synchronized (mLockObj) {
+            if (mSession != null) {
+                mCallProfile = mSession.getCallProfile();
+            }
+        }
     }
 
     /**
@@ -3102,6 +3118,10 @@ public class ImsCall implements ICall {
         sb.append(isOnHold() ? "Y" : "N");
         sb.append(" mute:");
         sb.append(isMuted() ? "Y" : "N");
+        if (mCallProfile != null) {
+            sb.append(" tech:");
+            sb.append(mCallProfile.getCallExtra(ImsCallProfile.EXTRA_CALL_RAT_TYPE));
+        }
         sb.append(" updateRequest:");
         sb.append(updateRequestToString(mUpdateRequest));
         sb.append(" merging:");
