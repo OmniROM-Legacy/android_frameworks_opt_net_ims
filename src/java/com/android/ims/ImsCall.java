@@ -1067,6 +1067,8 @@ public class ImsCall implements ICall {
         synchronized(mLockObj) {
             mSession = session;
 
+            mIsConferenceHost = true;
+
             try {
                 session.setListener(createCallSessionListener());
                 session.start(participants, mCallProfile);
@@ -1794,13 +1796,15 @@ public class ImsCall implements ICall {
             setIsMerged(playDisconnectTone);
             mSessionEndDuringMerge = true;
             String reasonInfo;
+            int reasonCode = ImsReasonInfo.CODE_UNSPECIFIED;
             if (playDisconnectTone) {
                 reasonInfo = "Call ended by network";
             } else {
                 reasonInfo = "Call ended during conference merge process.";
+                reasonCode = ImsReasonInfo.CODE_USER_TERMINATED_BY_REMOTE;
             }
             mSessionEndDuringMergeReasonInfo = new ImsReasonInfo(
-                    ImsReasonInfo.CODE_UNSPECIFIED, 0, reasonInfo);
+                    reasonCode, 0, reasonInfo);
         }
     }
 
@@ -1870,6 +1874,7 @@ public class ImsCall implements ICall {
                     swapRequired = true;
                 }
                 mMergePeer.markCallAsMerged(false);
+                mMergePeer.setIsMerged(true);
                 finalHostCall = this;
                 finalPeerCall = mMergePeer;
             } else {
@@ -2197,6 +2202,12 @@ public class ImsCall implements ICall {
                 logi("callSessionStartFailed :: not supported for transient conference session=" +
                         session);
                 return;
+            }
+
+            if (mIsConferenceHost) {
+                // If the dial request was a group calling one, this call would have
+                // been marked the conference host as part of the request.
+                mIsConferenceHost = false;
             }
 
             ImsCall.Listener listener;

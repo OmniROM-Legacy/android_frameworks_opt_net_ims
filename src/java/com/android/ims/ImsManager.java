@@ -31,6 +31,7 @@ import android.provider.Settings;
 import android.telecom.TelecomManager;
 import android.telephony.CarrierConfigManager;
 import android.telephony.Rlog;
+import android.telephony.SubscriptionInfo;
 import android.telephony.SubscriptionManager;
 import android.telephony.TelephonyManager;
 
@@ -42,10 +43,12 @@ import com.android.ims.internal.IImsService;
 import com.android.ims.internal.IImsUt;
 import com.android.ims.internal.ImsCallSession;
 import com.android.ims.internal.IImsConfig;
+import com.android.internal.telephony.TelephonyProperties;
 
 import java.io.FileDescriptor;
 import java.io.PrintWriter;
 import java.util.HashMap;
+import java.util.List;
 
 /**
  * Provides APIs for IMS services, such as initiating IMS calls, and provides access to
@@ -165,6 +168,7 @@ public class ImsManager {
 
     private Context mContext;
     private int mPhoneId;
+    private static int mImsPhoneId;
     private IImsService mImsService = null;
     private ImsServiceDeathRecipient mDeathRecipient = new ImsServiceDeathRecipient();
     // Ut interface for the supplementary service configuration
@@ -414,6 +418,39 @@ public class ImsManager {
                         CarrierConfigManager.KEY_CARRIER_DEFAULT_WFC_IMS_ENABLED_BOOL) ?
                         ImsConfig.FeatureValueConstants.ON : ImsConfig.FeatureValueConstants.OFF);
         return (enabled == 1) ? true : false;
+    }
+
+    public static boolean displayWfcMode(Context context, boolean update) {
+        boolean displayWfcMode = true;
+        List<SubscriptionInfo> subInfoList =
+                SubscriptionManager.from(context).getActiveSubscriptionInfoList();
+        if (subInfoList != null) {
+            CarrierConfigManager configManager = (CarrierConfigManager) context.getSystemService(
+                    Context.CARRIER_CONFIG_SERVICE);
+            for (SubscriptionInfo sir : subInfoList) {
+                int subId = sir.getSubscriptionId();
+                if (SubscriptionManager.isValidSubscriptionId(subId)) {
+                    PersistableBundle b = null;
+                    if (configManager != null) {
+                        b = configManager.getConfigForSubId(subId);
+                    }
+                    if (b != null) {
+                        displayWfcMode = b.getBoolean("config_display_wfc_mode", true);
+                    }
+                    if (!displayWfcMode) {
+                        if (update) {
+                            android.provider.Settings.Global.putInt(context.getContentResolver(),
+                                    android.provider.Settings.Global.WFC_IMS_MODE, b.getInt(
+                                    CarrierConfigManager.KEY_CARRIER_DEFAULT_WFC_IMS_MODE_INT));
+                        }
+                        break;
+                    }
+                }
+            }
+        } else {
+            loge("displayWfcMode: Invalid SubscriptionInfo");
+        }
+        return displayWfcMode;
     }
 
     /**
@@ -823,6 +860,7 @@ public class ImsManager {
         boolean isNetworkRoaming = TelephonyManager.getDefault().isNetworkRoaming();
         boolean available = isWfcEnabledByPlatform(mContext);
         boolean enabled = isWfcEnabledByUser(mContext);
+        displayWfcMode(mContext, true);
         int mode = getWfcMode(mContext, isNetworkRoaming);
         boolean roaming = isWfcRoamingEnabledByUser(mContext);
         boolean isFeatureOn = available && enabled;
@@ -900,7 +938,7 @@ public class ImsManager {
      * @see #getServiceId
      */
     public int open(int serviceClass, PendingIntent incomingCallPendingIntent,
-            ImsConnectionStateListener listener) throws ImsException {
+            ImsConnectionStateListener listener, int imsPhoneId) throws ImsException {
         checkAndThrowExceptionIfServiceUnavailable();
 
         if (incomingCallPendingIntent == null) {
@@ -912,9 +950,10 @@ public class ImsManager {
         }
 
         int result = 0;
+        mImsPhoneId = imsPhoneId;
 
         try {
-            result = mImsService.open(mPhoneId, serviceClass, incomingCallPendingIntent,
+            result = mImsService.open(mImsPhoneId, serviceClass, incomingCallPendingIntent,
                     createRegistrationListenerProxy(serviceClass, listener));
         } catch (RemoteException e) {
             throw new ImsException("open()", e,
@@ -1114,8 +1153,9 @@ public class ImsManager {
 
         call.setListener(listener);
         ImsCallSession session = createCallSession(serviceId, profile);
-
-        if ((callees != null) && (callees.length == 1)) {
+        boolean isConferenceUri = profile.getCallExtraBoolean(
+                TelephonyProperties.EXTRAS_IS_CONFERENCE_URI, false);
+        if (!isConferenceUri && (callees != null) && (callees.length == 1)) {
             call.start(session, callees[0]);
         } else {
             call.start(session, callees);
@@ -1237,8 +1277,11 @@ public class ImsManager {
         CarrierConfigManager configManager = (CarrierConfigManager) context.getSystemService(
                 Context.CARRIER_CONFIG_SERVICE);
         PersistableBundle b = null;
-        if (configManager != null) {
-            b = configManager.getConfig();
+        int[] subId = SubscriptionManager.getSubId(mImsPhoneId);
+        SubscriptionManager subscriptionManager = SubscriptionManager.from(context);
+        if (configManager != null && subId != null && subscriptionManager != null &&
+                subscriptionManager.isActiveSubId(subId[0])) {
+            b = configManager.getConfigForSubId(subId[0]);
         }
         if (b != null) {
             return b.getBoolean(key);
@@ -1466,7 +1509,7 @@ public class ImsManager {
 
             if (mContext != null) {
                 Intent intent = new Intent(ACTION_IMS_SERVICE_DOWN);
-                intent.putExtra(EXTRA_PHONE_ID, mPhoneId);
+                intent.putExtra(EXTRA_PHONE_ID, mImsPhoneId);
                 mContext.sendBroadcast(new Intent(intent));
             }
         }
